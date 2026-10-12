@@ -1,0 +1,653 @@
+/*
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package cloudprovider
+
+import (
+	"context"
+	stderrors "errors"
+	"fmt"
+	"time"
+
+	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	"github.com/awslabs/operatorpkg/status"
+	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"sigs.k8s.io/karpenter/pkg/controllers/nodeoverlay"
+	"sigs.k8s.io/karpenter/pkg/scheduling"
+
+	"sigs.k8s.io/controller-runtime/pkg/log"
+	coreapis "sigs.k8s.io/karpenter/pkg/apis"
+	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/events"
+	karpoptions "sigs.k8s.io/karpenter/pkg/operator/options"
+	"sigs.k8s.io/karpenter/pkg/utils/resources"
+
+	"github.com/aws/karpenter-provider-aws/pkg/apis"
+	v1 "github.com/aws/karpenter-provider-aws/pkg/apis/v1"
+	"github.com/aws/karpenter-provider-aws/pkg/operator/options"
+	"github.com/aws/karpenter-provider-aws/pkg/utils"
+
+	"github.com/samber/lo"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	cloudproviderevents "github.com/aws/karpenter-provider-aws/pkg/cloudprovider/events"
+	"github.com/aws/karpenter-provider-aws/pkg/providers/amifamily"
+	"github.com/aws/karpenter-provider-aws/pkg/providers/capacityreservation"
+	"github.com/aws/karpenter-provider-aws/pkg/providers/efadra"
+	"github.com/aws/karpenter-provider-aws/pkg/providers/instance"
+	"github.com/aws/karpenter-provider-aws/pkg/providers/instancetype"
+	"github.com/aws/karpenter-provider-aws/pkg/providers/nvidiadra"
+	"github.com/aws/karpenter-provider-aws/pkg/providers/placementgroup"
+	"github.com/aws/karpenter-provider-aws/pkg/providers/securitygroup"
+
+	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+)
+
+var _ cloudprovider.CloudProvider = (*CloudProvider)(nil)
+
+type CloudProvider struct {
+	kubeClient client.Client
+	recorder   events.Recorder
+
+	instanceTypeProvider        instancetype.Provider
+	instanceProvider            instance.Provider
+	amiProvider                 amifamily.Provider
+	securityGroupProvider       securitygroup.Provider
+	capacityReservationProvider capacityreservation.Provider
+	placementGroupProvider      placementgroup.Provider
+	instanceTypeStore           *nodeoverlay.InstanceTypeStore
+	nvidiaDRAProvider           nvidiadra.Provider
+	efaDRAProvider              efadra.Provider
+	legacyRepairPolicies        bool
+	rebootForRepair             bool
+	caBundle                    *string
+}
+
+func New(
+	instanceTypeProvider instancetype.Provider,
+	instanceProvider instance.Provider,
+	recorder events.Recorder,
+	kubeClient client.Client,
+	amiProvider amifamily.Provider,
+	securityGroupProvider securitygroup.Provider,
+	capacityReservationProvider capacityreservation.Provider,
+	placementGroupProvider placementgroup.Provider,
+	store *nodeoverlay.InstanceTypeStore,
+	caBundle *string,
+	opts ...Option,
+) *CloudProvider {
+	c := &CloudProvider{
+		instanceTypeProvider:        instanceTypeProvider,
+		instanceProvider:            instanceProvider,
+		kubeClient:                  kubeClient,
+		amiProvider:                 amiProvider,
+		securityGroupProvider:       securityGroupProvider,
+		capacityReservationProvider: capacityReservationProvider,
+		placementGroupProvider:      placementGroupProvider,
+		recorder:                    recorder,
+		instanceTypeStore:           store,
+		nvidiaDRAProvider:           nvidiadra.NewDefaultProvider(),
+		efaDRAProvider:              efadra.NewDefaultProvider(),
+		caBundle:                    caBundle,
+	}
+	for _, opt := range opts {
+		opt(c)
+	}
+	return c
+}
+
+// Option configures a CloudProvider.
+type Option func(*CloudProvider)
+
+// WithLegacyRepairPolicies makes RepairPolicies return the policies the legacy node repair controller used before node
+// repair became a disruption method. Set it with --legacy-node-repair so the legacy controller repairs on the same
+// conditions and timing as before.
+func WithLegacyRepairPolicies(enabled bool) Option {
+	return func(c *CloudProvider) { c.legacyRepairPolicies = enabled }
+}
+
+// WithRebootForRepair makes the reboot-clearable repair policies reboot the node in place instead of replacing it.
+func WithRebootForRepair(enabled bool) Option {
+	return func(c *CloudProvider) { c.rebootForRepair = enabled }
+}
+
+// Create a NodeClaim given the constraints.
+//
+//nolint:gocyclo
+func (c *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim) (*karpv1.NodeClaim, error) {
+	nodeClass, err := c.resolveNodeClassFromNodeClaim(ctx, nodeClaim)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			// We treat a failure to resolve the NodeClass as an ICE since this means there is no capacity possibilities for this NodeClaim
+			c.recorder.Publish(cloudproviderevents.NodeClaimFailedToResolveNodeClass(nodeClaim))
+			return nil, cloudprovider.NewInsufficientCapacityError(fmt.Errorf("resolving nodeclass, %w", err))
+		}
+		// Transient error when resolving the NodeClass
+		return nil, fmt.Errorf("resolving nodeclass, %w", err)
+	}
+
+	nodeClassReady := nodeClass.StatusConditions().Get(status.ConditionReady)
+	if nodeClassReady.IsFalse() {
+		return nil, cloudprovider.NewNodeClassNotReadyError(stderrors.New(nodeClassReady.Message))
+	}
+	if nodeClassReady.IsUnknown() {
+		return nil, cloudprovider.NewCreateError(fmt.Errorf("resolving nodeclass readiness, nodeclass is in Ready=Unknown, %s", nodeClassReady.Message), "NodeClassReadinessUnknown", "NodeClass is in Ready=Unknown")
+	}
+	if nodeClassReady != nil && nodeClassReady.ObservedGeneration != nodeClass.Generation {
+		return nil, cloudprovider.NewNodeClassNotReadyError(fmt.Errorf("nodeclass status has not been reconciled against the latest spec"))
+	}
+	tags, err := utils.GetTags(nodeClass, nodeClaim, options.FromContext(ctx).ClusterName)
+	if err != nil {
+		return nil, cloudprovider.NewNodeClassNotReadyError(err)
+	}
+	instanceTypes, err := c.instanceTypeProvider.List(ctx, nodeClass)
+	if err != nil {
+		return nil, cloudprovider.NewCreateError(fmt.Errorf("resolving instance types, %w", err), "InstanceTypeResolutionFailed", "Error resolving instance types")
+	}
+	if karpoptions.FromContext(ctx).FeatureGates.NodeOverlay {
+		// NodeOverlays are applied able to a set of instance types defined in a NodePool
+		// This means standalone node claims do not support node overlays.
+		// This choice was made as there are no active use cases for it
+		if nodePoolName, ok := nodeClaim.Labels[v1.NodePoolTagKey]; ok {
+			instanceTypes, err = c.instanceTypeStore.ApplyAll(nodePoolName, instanceTypes)
+			if err != nil {
+				return nil, fmt.Errorf("creating instance, %w", err)
+			}
+		}
+	}
+	instance, err := c.instanceProvider.Create(ctx, nodeClass, nodeClaim, tags, instanceTypes)
+	if err != nil {
+		return nil, fmt.Errorf("creating instance, %w", err)
+	}
+	if instance.CapacityType == karpv1.CapacityTypeReserved {
+		c.capacityReservationProvider.MarkLaunched(instance.CapacityReservationDetails.ID)
+	}
+	instanceType, _ := lo.Find(instanceTypes, func(i *cloudprovider.InstanceType) bool {
+		return i.Name == string(instance.Type)
+	})
+	nc := c.instanceToNodeClaim(ctx, instance, instanceType, nodeClass, nodeClaim)
+	nc.Annotations = lo.Assign(nc.Annotations, map[string]string{
+		v1.AnnotationEC2NodeClassHash:        nodeClass.Hash(c.caBundle),
+		v1.AnnotationEC2NodeClassHashVersion: v1.EC2NodeClassHashVersion,
+		v1.AnnotationInstanceProfile:         nodeClass.Status.InstanceProfile,
+	})
+	return nc, nil
+}
+
+func (c *CloudProvider) List(ctx context.Context) ([]*karpv1.NodeClaim, error) {
+	instances, err := c.instanceProvider.List(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("listing instances, %w", err)
+	}
+	var nodeClaims []*karpv1.NodeClaim
+	for _, it := range instances {
+		instanceType, err := c.resolveInstanceTypeFromInstance(ctx, it)
+		if err != nil {
+			return nil, fmt.Errorf("resolving instance type, %w", err)
+		}
+		nc, err := c.resolveNodeClassFromInstance(ctx, it)
+		if client.IgnoreNotFound(err) != nil {
+			return nil, fmt.Errorf("resolving nodeclass, %w", err)
+		}
+		nodeClaims = append(nodeClaims, c.instanceToNodeClaim(ctx, it, instanceType, nc, nil))
+	}
+	return nodeClaims, nil
+}
+
+func (c *CloudProvider) Get(ctx context.Context, providerID string) (*karpv1.NodeClaim, error) {
+	id, err := utils.ParseInstanceID(providerID)
+	if err != nil {
+		return nil, fmt.Errorf("getting instance ID, %w", err)
+	}
+	ctx = log.IntoContext(ctx, log.FromContext(ctx).WithValues("id", id))
+	instance, err := c.instanceProvider.Get(ctx, id)
+	if err != nil {
+		return nil, fmt.Errorf("getting instance, %w", err)
+	}
+	instanceType, err := c.resolveInstanceTypeFromInstance(ctx, instance)
+	if err != nil {
+		return nil, fmt.Errorf("resolving instance type, %w", err)
+	}
+	nc, err := c.resolveNodeClassFromInstance(ctx, instance)
+	if client.IgnoreNotFound(err) != nil {
+		return nil, fmt.Errorf("resolving nodeclass, %w", err)
+	}
+	return c.instanceToNodeClaim(ctx, instance, instanceType, nc, nil), nil
+}
+
+// GetInstanceTypes returns all available InstanceTypes
+func (c *CloudProvider) GetInstanceTypes(ctx context.Context, nodePool *karpv1.NodePool) ([]*cloudprovider.InstanceType, error) {
+	nodeClass, err := c.resolveNodeClassFromNodePool(ctx, nodePool)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			// If we can't resolve the NodeClass, then it's impossible for us to resolve the instance types
+			c.recorder.Publish(cloudproviderevents.NodePoolFailedToResolveNodeClass(nodePool))
+			return nil, nil
+		}
+		return nil, fmt.Errorf("resolving nodeclass, %w", err)
+	}
+	// TODO, break this coupling
+	instanceTypes, err := c.instanceTypeProvider.List(ctx, nodeClass)
+	if err != nil {
+		return nil, err
+	}
+	// Populate DRA DynamicResources for the instance types, based on the DRA drivers we support.
+	c.populateDynamicResources(ctx, nodeClass, instanceTypes)
+	return instanceTypes, nil
+}
+
+// getInstanceType returns a specific instance type to avoid re-constructing all InstanceTypes
+func (c *CloudProvider) getInstanceType(ctx context.Context, nodePool *karpv1.NodePool, name ec2types.InstanceType) (*cloudprovider.InstanceType, error) {
+	nodeClass, err := c.resolveNodeClassFromNodePool(ctx, nodePool)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			// If we can't resolve the NodeClass, then it's impossible for us to resolve the instance types
+			c.recorder.Publish(cloudproviderevents.NodePoolFailedToResolveNodeClass(nodePool))
+			return nil, nil
+		}
+		return nil, fmt.Errorf("resolving nodeclass, %w", err)
+	}
+	it, err := c.instanceTypeProvider.Get(ctx, nodeClass, name)
+	if err != nil {
+		return nil, fmt.Errorf("resolving instancetype, %w", err)
+	}
+	if karpoptions.FromContext(ctx).FeatureGates.NodeOverlay {
+		it, err = c.instanceTypeStore.Apply(nodePool.Name, it)
+		if err != nil {
+			return nil, fmt.Errorf("resolving instancetype, %w", err)
+		}
+	}
+
+	return it, err
+}
+
+func (c *CloudProvider) Delete(ctx context.Context, nodeClaim *karpv1.NodeClaim) error {
+	id, err := utils.ParseInstanceID(nodeClaim.Status.ProviderID)
+	if err != nil {
+		return fmt.Errorf("getting instance ID, %w", err)
+	}
+	ctx = log.IntoContext(ctx, log.FromContext(ctx).WithValues("id", id))
+	err = c.instanceProvider.Delete(ctx, id)
+	if reservationID := nodeClaim.Labels[cloudprovider.ReservationIDLabel]; reservationID != "" && cloudprovider.IsNodeClaimNotFoundError(err) {
+		c.capacityReservationProvider.MarkTerminated(reservationID, id)
+	}
+	return err
+}
+
+func (c *CloudProvider) Reboot(ctx context.Context, nodeClaim *karpv1.NodeClaim, operationID string) error {
+	id, err := utils.ParseInstanceID(nodeClaim.Status.ProviderID)
+	if err != nil {
+		return fmt.Errorf("getting instance ID, %w", err)
+	}
+	ctx = log.IntoContext(ctx, log.FromContext(ctx).WithValues("id", id))
+	return c.instanceProvider.Reboot(ctx, id, operationID)
+}
+
+func (c *CloudProvider) DisruptionReasons() []karpv1.DisruptionReason {
+	return nil
+}
+
+func (c *CloudProvider) IsDrifted(ctx context.Context, nodeClaim *karpv1.NodeClaim) (cloudprovider.DriftReason, error) {
+	// Not needed when GetInstanceTypes removes nodepool dependency
+	nodePoolName, ok := nodeClaim.Labels[karpv1.NodePoolLabelKey]
+	if !ok {
+		return "", nil
+	}
+	nodePool := &karpv1.NodePool{}
+	if err := c.kubeClient.Get(ctx, types.NamespacedName{Name: nodePoolName}, nodePool); err != nil {
+		return "", client.IgnoreNotFound(err)
+	}
+	if nodePool.Spec.Template.Spec.NodeClassRef == nil {
+		return "", nil
+	}
+	nodeClass, err := c.resolveNodeClassFromNodePool(ctx, nodePool)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			// We can't determine the drift status for the NodeClaim if we can no longer resolve the NodeClass
+			c.recorder.Publish(cloudproviderevents.NodePoolFailedToResolveNodeClass(nodePool))
+			return "", nil
+		}
+		return "", fmt.Errorf("resolving nodeclass, %w", err)
+	}
+	driftReason, err := c.isNodeClassDrifted(ctx, nodeClaim, nodePool, nodeClass)
+	if err != nil {
+		return "", err
+	}
+	return driftReason, nil
+}
+
+// Name returns the CloudProvider implementation name.
+func (c *CloudProvider) Name() string {
+	return "aws"
+}
+
+func (c *CloudProvider) GetSupportedNodeClasses() []status.Object {
+	return []status.Object{&v1.EC2NodeClass{}}
+}
+
+func (c *CloudProvider) RepairPolicies() []cloudprovider.RepairPolicy {
+	if c.legacyRepairPolicies {
+		return legacyRepairPolicies
+	}
+	return []cloudprovider.RepairPolicy{
+		// Supported Kubelet Node Conditions
+		//
+		// The AcceleratedHardwareReady catch-all below is the global fallback (empty ReasonRegex); every other policy sets a ReasonRegex.
+		{
+			ConditionType:      corev1.NodeReady,
+			ConditionStatus:    corev1.ConditionFalse,
+			ReasonRegex:        ".*",
+			TolerationDuration: 30 * time.Minute,
+			// Kubelet is reporting NotReady but is still alive, so a bounded graceful drain can honor PDBs. The bound
+			// exists so repair is never the unbounded (~19-day) drain hang that a nil NodeClaim TerminationGracePeriod
+			// would otherwise permit.
+			TerminationGracePeriod: lo.ToPtr(10 * time.Minute),
+			Action:                 cloudprovider.ReplaceNode,
+		},
+		{
+			ConditionType:          corev1.NodeReady,
+			ConditionStatus:        corev1.ConditionUnknown,
+			ReasonRegex:            ".*",
+			TolerationDuration:     30 * time.Minute,
+			TerminationGracePeriod: lo.ToPtr(10 * time.Minute),
+			Action:                 cloudprovider.ReplaceNode,
+		},
+		// Support Node Monitoring Agent Conditions
+		//
+		// AcceleratedHardwareReady is split by reason: the Node Monitoring Agent emits the GPU XID code in the
+		// condition reason, and different XID families warrant different handling (mirroring MNG's repairRules).
+		// ReasonRegex is a Go regex over each reason; the wrapping ".*" lets it match an XID code embedded anywhere in
+		// the reason token.
+		{
+			// Reboot-clearable GPU faults (transient XIDs). Rebooting preserves the scarce GPU instance; without the
+			// RebootForRepair feature gate the node is replaced instead, on the same timing.
+			ConditionType:          "AcceleratedHardwareReady",
+			ConditionStatus:        corev1.ConditionFalse,
+			ReasonRegex:            `.*XID(46|48|54|62|63|95|109|110|136|140|143|155|156|158).*`,
+			TolerationDuration:     10 * time.Minute,
+			TerminationGracePeriod: lo.ToPtr(5 * time.Minute),
+			Action:                 lo.Ternary(c.rebootForRepair, cloudprovider.RebootNode, cloudprovider.ReplaceNode),
+		},
+		{
+			// Fatal / uncorrectable GPU errors — replace fast, a reboot would only waste time on dead hardware.
+			ConditionType:          "AcceleratedHardwareReady",
+			ConditionStatus:        corev1.ConditionFalse,
+			ReasonRegex:            `.*XID(64|74|79|119|120).*`,
+			TolerationDuration:     10 * time.Minute,
+			TerminationGracePeriod: lo.ToPtr(5 * time.Minute),
+			Action:                 cloudprovider.ReplaceNode,
+		},
+		{
+			// Default fallback (empty ReasonRegex, the only one allowed per policy set): an unrecognized GPU fault gets a
+			// longer 30m confidence delay before we replace, since we can't attribute it to a known reboot/replace family.
+			ConditionType:          "AcceleratedHardwareReady",
+			ConditionStatus:        corev1.ConditionFalse,
+			TolerationDuration:     30 * time.Minute,
+			TerminationGracePeriod: lo.ToPtr(10 * time.Minute),
+			Action:                 cloudprovider.ReplaceNode,
+		},
+		{
+			ConditionType:          "StorageReady",
+			ConditionStatus:        corev1.ConditionFalse,
+			ReasonRegex:            ".*",
+			TolerationDuration:     30 * time.Minute,
+			TerminationGracePeriod: lo.ToPtr(10 * time.Minute),
+			Action:                 cloudprovider.ReplaceNode,
+		},
+		{
+			ConditionType:          "NetworkingReady",
+			ConditionStatus:        corev1.ConditionFalse,
+			ReasonRegex:            ".*",
+			TolerationDuration:     30 * time.Minute,
+			TerminationGracePeriod: lo.ToPtr(10 * time.Minute),
+			Action:                 cloudprovider.ReplaceNode,
+		},
+		{
+			ConditionType:          "KernelReady",
+			ConditionStatus:        corev1.ConditionFalse,
+			ReasonRegex:            ".*",
+			TolerationDuration:     30 * time.Minute,
+			TerminationGracePeriod: lo.ToPtr(10 * time.Minute),
+			Action:                 cloudprovider.ReplaceNode,
+		},
+		{
+			ConditionType:          "ContainerRuntimeReady",
+			ConditionStatus:        corev1.ConditionFalse,
+			ReasonRegex:            ".*",
+			TolerationDuration:     30 * time.Minute,
+			TerminationGracePeriod: lo.ToPtr(10 * time.Minute),
+			Action:                 cloudprovider.ReplaceNode,
+		},
+	}
+}
+
+func (c *CloudProvider) resolveNodeClassFromNodeClaim(ctx context.Context, nodeClaim *karpv1.NodeClaim) (*v1.EC2NodeClass, error) {
+	nodeClass := &v1.EC2NodeClass{}
+	if err := c.kubeClient.Get(ctx, types.NamespacedName{Name: nodeClaim.Spec.NodeClassRef.Name}, nodeClass); err != nil {
+		return nil, err
+	}
+	// For the purposes of NodeClass CloudProvider resolution, we treat deleting NodeClasses as NotFound
+	if !nodeClass.DeletionTimestamp.IsZero() {
+		// For the purposes of NodeClass CloudProvider resolution, we treat deleting NodeClasses as NotFound,
+		// but we return a different error message to be clearer to users
+		return nil, newTerminatingNodeClassError(nodeClass.Name)
+	}
+	return nodeClass, nil
+}
+
+func (c *CloudProvider) resolveNodeClassFromNodePool(ctx context.Context, nodePool *karpv1.NodePool) (*v1.EC2NodeClass, error) {
+	nodeClass := &v1.EC2NodeClass{}
+	if err := c.kubeClient.Get(ctx, types.NamespacedName{Name: nodePool.Spec.Template.Spec.NodeClassRef.Name}, nodeClass); err != nil {
+		return nil, err
+	}
+	if !nodeClass.DeletionTimestamp.IsZero() {
+		// For the purposes of NodeClass CloudProvider resolution, we treat deleting NodeClasses as NotFound,
+		// but we return a different error message to be clearer to users
+		return nil, newTerminatingNodeClassError(nodeClass.Name)
+	}
+	return nodeClass, nil
+}
+
+func (c *CloudProvider) resolveInstanceTypeFromInstance(ctx context.Context, instance *instance.Instance) (*cloudprovider.InstanceType, error) {
+	nodePool, err := c.resolveNodePoolFromInstance(ctx, instance)
+	if err != nil {
+		// If we can't resolve the NodePool, we fall back to not getting instance type info
+		return nil, client.IgnoreNotFound(fmt.Errorf("resolving nodepool, %w", err))
+	}
+	instanceType, err := c.getInstanceType(ctx, nodePool, instance.Type)
+	if err != nil {
+		// If we can't resolve the NodePool, we fall back to not getting instance type info
+		return nil, client.IgnoreNotFound(fmt.Errorf("resolving instance type, %w", err))
+	}
+	return instanceType, nil
+}
+
+func (c *CloudProvider) resolveNodeClassFromInstance(ctx context.Context, instance *instance.Instance) (*v1.EC2NodeClass, error) {
+	name, ok := instance.Tags[v1.NodeClassTagKey]
+	if !ok {
+		return nil, errors.NewNotFound(schema.GroupResource{Group: apis.Group, Resource: "ec2nodeclasses"}, "")
+	}
+	nc := &v1.EC2NodeClass{}
+	if err := c.kubeClient.Get(ctx, types.NamespacedName{Name: name}, nc); err != nil {
+		return nil, fmt.Errorf("resolving ec2nodeclass, %w", err)
+	}
+	if !nc.DeletionTimestamp.IsZero() {
+		// For the purposes of NodeClass CloudProvider resolution, we treat deleting NodeClasses as NotFound,
+		// but we return a different error message to be clearer to users
+		return nil, newTerminatingNodeClassError(nc.Name)
+	}
+	return nc, nil
+}
+
+func (c *CloudProvider) resolveNodePoolFromInstance(ctx context.Context, instance *instance.Instance) (*karpv1.NodePool, error) {
+	if nodePoolName, ok := instance.Tags[karpv1.NodePoolLabelKey]; ok {
+		nodePool := &karpv1.NodePool{}
+		if err := c.kubeClient.Get(ctx, types.NamespacedName{Name: nodePoolName}, nodePool); err != nil {
+			return nil, err
+		}
+		return nodePool, nil
+	}
+	return nil, errors.NewNotFound(schema.GroupResource{Group: coreapis.Group, Resource: "nodepools"}, "")
+}
+
+//nolint:gocyclo
+func (c *CloudProvider) instanceToNodeClaim(ctx context.Context, i *instance.Instance, instanceType *cloudprovider.InstanceType, nodeClass *v1.EC2NodeClass, originalNodeClaim *karpv1.NodeClaim) *karpv1.NodeClaim {
+	nodeClaim := &karpv1.NodeClaim{}
+	labels := map[string]string{}
+	annotations := map[string]string{}
+
+	if instanceType != nil {
+		for key, req := range instanceType.Requirements {
+			// We only want to add a label based on the instance type requirements if there is a single value for that
+			// requirement. For example, we can't add a label for zone based on this if the requirement is compatible with
+			// three. Capacity reservation IDs are a special case since we don't have a way to represent that the label may or
+			// may not exist. Since this requirement will be present regardless of the capacity type, we can't insert it here.
+			// Otherwise, you may end up with spot and on-demand NodeClaims with a reservation ID label.
+			if req.Len() == 1 && !lo.Contains([]string{
+				cloudprovider.ReservationIDLabel,
+				v1.LabelCapacityReservationType,
+				v1.LabelCapacityReservationInterruptible,
+			}, req.Key) {
+				labels[key] = req.Values()[0]
+			}
+		}
+		resourceFilter := func(n corev1.ResourceName, v resource.Quantity) bool {
+			if resources.IsZero(v) {
+				return false
+			}
+			// The nodeclaim should only advertise an EFA resource if it was requested by the pod or configured on the NodeClass. EFA network interfaces are
+			// added to the launch template if they're requested or NodeClass network interfaces are configured, otherwise the instance is launched with a normal ENI.
+			if n == v1.ResourceEFA {
+				return i.EFACount > 0
+			}
+			return true
+		}
+		nodeClaim.Status.Capacity = lo.PickBy(instanceType.Capacity, resourceFilter)
+		nodeClaim.Status.Allocatable = lo.PickBy(instanceType.Allocatable(), resourceFilter)
+	}
+	labels[corev1.LabelTopologyZone] = i.Zone
+	// Attempt to resolve the zoneID from the instance's EC2NodeClass' status condition.
+	// If the EC2NodeClass is nil, we know we're in the List or Get paths, where we don't care about the zone-id value.
+	// If we're in the Create path, we've already validated the EC2NodeClass exists. In this case, we resolve the zone-id from the status condition
+	// both when creating offerings and when adding the label.
+	if nodeClass != nil {
+		if subnet, ok := lo.Find(nodeClass.Status.Subnets, func(s v1.Subnet) bool {
+			return s.Zone == i.Zone
+		}); ok && subnet.ZoneID != "" {
+			labels[v1.LabelTopologyZoneID] = subnet.ZoneID
+		}
+	}
+	labels[karpv1.CapacityTypeLabelKey] = i.CapacityType
+	labels[v1.LabelInstanceTenancy] = i.Tenancy
+	if i.CapacityType == karpv1.CapacityTypeReserved {
+		labels[cloudprovider.ReservationIDLabel] = i.CapacityReservationDetails.ID
+		labels[v1.LabelCapacityReservationType] = string(i.CapacityReservationDetails.Type)
+		labels[v1.LabelCapacityReservationInterruptible] = fmt.Sprintf("%t", i.CapacityReservationDetails.Interruptible)
+	}
+	// Placement group labels
+	if nodeClass != nil {
+		if pg, _ := c.placementGroupProvider.Get(ctx, nodeClass); pg != nil {
+			labels[v1.LabelPlacementGroupID] = pg.ID
+			if pg.Strategy == placementgroup.StrategyPartition {
+				// If the scheduler targeted a specific partition (from the offering), use that value.
+				// Otherwise, set the empty sentinel for the registration hook to resolve via DescribeInstances.
+				labels[v1.LabelPlacementGroupPartition] = ""
+				if originalNodeClaim != nil {
+					reqs := scheduling.NewNodeSelectorRequirementsWithMinValues(originalNodeClaim.Spec.Requirements...)
+					if partitionReq := reqs.Get(v1.LabelPlacementGroupPartition); partitionReq != nil {
+						if values := partitionReq.Values(); len(values) > 0 {
+							labels[v1.LabelPlacementGroupPartition] = values[0]
+						}
+					}
+				}
+			}
+		}
+	}
+	if v, ok := i.Tags[karpv1.NodePoolLabelKey]; ok {
+		labels[karpv1.NodePoolLabelKey] = v
+	}
+	nodeClaim.Labels = labels
+	nodeClaim.Annotations = annotations
+	nodeClaim.CreationTimestamp = metav1.Time{Time: i.LaunchTime}
+	// Set the deletionTimestamp to be the current time if the instance is currently terminating
+	if i.State == ec2types.InstanceStateNameShuttingDown || i.State == ec2types.InstanceStateNameTerminated {
+		nodeClaim.DeletionTimestamp = &metav1.Time{Time: time.Now()}
+	}
+	nodeClaim.Status.ProviderID = fmt.Sprintf("aws:///%s/%s", i.Zone, i.ID)
+	nodeClaim.Status.ImageID = i.ImageID
+	return nodeClaim
+}
+
+// newTerminatingNodeClassError returns a NotFound error for handling by
+func newTerminatingNodeClassError(name string) *errors.StatusError {
+	qualifiedResource := schema.GroupResource{Group: apis.Group, Resource: "ec2nodeclasses"}
+	err := errors.NewNotFound(qualifiedResource, name)
+	err.ErrStatus.Message = fmt.Sprintf("%s %q is terminating, treating as not found", qualifiedResource.String(), name)
+	return err
+}
+
+// legacyRepairPolicies are the repair policies from before node repair became a disruption method (1.14), for the
+// legacy node repair controller. They replace on every reason of each condition, and leave the drain to the legacy
+// controller, which terminates forcefully.
+var legacyRepairPolicies = []cloudprovider.RepairPolicy{
+	// Supported Kubelet Node Conditions
+	{
+		ConditionType:      corev1.NodeReady,
+		ConditionStatus:    corev1.ConditionFalse,
+		TolerationDuration: 30 * time.Minute,
+		Action:             cloudprovider.ReplaceNode,
+	},
+	{
+		ConditionType:      corev1.NodeReady,
+		ConditionStatus:    corev1.ConditionUnknown,
+		TolerationDuration: 30 * time.Minute,
+		Action:             cloudprovider.ReplaceNode,
+	},
+	// Support Node Monitoring Agent Conditions
+	{
+		ConditionType:      "AcceleratedHardwareReady",
+		ConditionStatus:    corev1.ConditionFalse,
+		TolerationDuration: 10 * time.Minute,
+		Action:             cloudprovider.ReplaceNode,
+	},
+	{
+		ConditionType:      "StorageReady",
+		ConditionStatus:    corev1.ConditionFalse,
+		TolerationDuration: 30 * time.Minute,
+		Action:             cloudprovider.ReplaceNode,
+	},
+	{
+		ConditionType:      "NetworkingReady",
+		ConditionStatus:    corev1.ConditionFalse,
+		TolerationDuration: 30 * time.Minute,
+		Action:             cloudprovider.ReplaceNode,
+	},
+	{
+		ConditionType:      "KernelReady",
+		ConditionStatus:    corev1.ConditionFalse,
+		TolerationDuration: 30 * time.Minute,
+		Action:             cloudprovider.ReplaceNode,
+	},
+	{
+		ConditionType:      "ContainerRuntimeReady",
+		ConditionStatus:    corev1.ConditionFalse,
+		TolerationDuration: 30 * time.Minute,
+		Action:             cloudprovider.ReplaceNode,
+	},
+}

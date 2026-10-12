@@ -1,0 +1,147 @@
+/*
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package options
+
+import (
+	"context"
+	"errors"
+	"flag"
+	"fmt"
+	"os"
+	"time"
+
+	cliflag "k8s.io/component-base/cli/flag"
+	coreoptions "sigs.k8s.io/karpenter/pkg/operator/options"
+	"sigs.k8s.io/karpenter/pkg/utils/env"
+
+	"github.com/aws/karpenter-provider-aws/pkg/utils"
+)
+
+func init() {
+	coreoptions.Injectables = append(coreoptions.Injectables, &Options{})
+}
+
+type optionsKey struct{}
+
+type FeatureGates struct {
+	inputStr string
+
+	NodeClassCEL    bool
+	DRANVIDIAGPU    bool
+	DRAEFA          bool
+	RebootForRepair bool
+}
+
+type Options struct {
+	ClusterCABundle              string
+	ClusterName                  string
+	ClusterEndpoint              string
+	IsolatedVPC                  bool
+	EKSControlPlane              bool
+	VMMemoryOverheadPercent      float64
+	InterruptionQueue            string
+	ReservedENIs                 int
+	DisableDryRun                bool
+	EnableZonalShift             bool
+	AMIRefreshInterval           time.Duration
+	SubnetRefreshInterval        time.Duration
+	SecurityGroupRefreshInterval time.Duration
+	FeatureGates                 FeatureGates
+}
+
+func (o *Options) AddFlags(fs *coreoptions.FlagSet) {
+	fs.StringVar(&o.ClusterCABundle, "cluster-ca-bundle", env.WithDefaultString("CLUSTER_CA_BUNDLE", ""), "Cluster CA bundle for nodes to use for TLS connections with the API server. If not set, this is taken from the controller's TLS configuration.")
+	fs.StringVar(&o.ClusterName, "cluster-name", env.WithDefaultString("CLUSTER_NAME", ""), "[REQUIRED] The kubernetes cluster name for resource discovery.")
+	fs.StringVar(&o.ClusterEndpoint, "cluster-endpoint", env.WithDefaultString("CLUSTER_ENDPOINT", ""), "The external kubernetes cluster endpoint for new nodes to connect with. If not specified, will discover the cluster endpoint using DescribeCluster API.")
+	fs.BoolVarWithEnv(&o.IsolatedVPC, "isolated-vpc", "ISOLATED_VPC", false, "If true, then assume we can't reach AWS services which don't have a VPC endpoint. This also has the effect of disabling look-ups to the AWS on-demand pricing endpoint.")
+	fs.BoolVarWithEnv(&o.EKSControlPlane, "eks-control-plane", "EKS_CONTROL_PLANE", false, "Marking this true means that your cluster is running with an EKS control plane and Karpenter should attempt to discover cluster details from the DescribeCluster API ")
+	fs.Float64Var(&o.VMMemoryOverheadPercent, "vm-memory-overhead-percent", utils.WithDefaultFloat64("VM_MEMORY_OVERHEAD_PERCENT", 0.075), "The VM memory overhead as a percent that will be subtracted from the total memory for all instance types when cached information is unavailable.")
+	fs.StringVar(&o.InterruptionQueue, "interruption-queue", env.WithDefaultString("INTERRUPTION_QUEUE", ""), "Interruption queue is the name of the SQS queue used for processing interruption events from EC2. Interruption handling is disabled if not specified. Enabling interruption handling may require additional permissions on the controller service account. Additional permissions are outlined in the docs.")
+	fs.IntVar(&o.ReservedENIs, "reserved-enis", env.WithDefaultInt("RESERVED_ENIS", 0), "Reserved ENIs are not included in the calculations for max-pods or kube-reserved. This is most often used in the VPC CNI custom networking setup https://docs.aws.amazon.com/eks/latest/userguide/cni-custom-network.html.")
+	fs.BoolVarWithEnv(&o.DisableDryRun, "disable-dry-run", "DISABLE_DRY_RUN", false, "If true, then disable dry run validation for EC2NodeClasses.")
+	fs.BoolVarWithEnv(&o.EnableZonalShift, "enable-zonal-shift", "ENABLE_ZONAL_SHIFT", false, "If true, then enable zonal shifting feature.")
+	fs.DurationVar(&o.AMIRefreshInterval, "ami-refresh-interval", env.WithDefaultDuration("AMI_REFRESH_INTERVAL", time.Minute), "How often Karpenter refreshes AMI data from EC2. Increasing this value will reduce the number of DescribeImages API calls at the cost of increased staleness in AMI discovery and drift detection. Must be at least 1m.")
+	fs.DurationVar(&o.SubnetRefreshInterval, "subnet-refresh-interval", env.WithDefaultDuration("SUBNET_REFRESH_INTERVAL", time.Minute), "How often Karpenter refreshes subnet data from EC2. Increasing this value will reduce the number of DescribeSubnets API calls at the cost of increased staleness in subnet discovery. Must be at least 1m.")
+	fs.DurationVar(&o.SecurityGroupRefreshInterval, "security-group-refresh-interval", env.WithDefaultDuration("SECURITY_GROUP_REFRESH_INTERVAL", time.Minute), "How often Karpenter refreshes security group data from EC2. Increasing this value will reduce the number of DescribeSecurityGroups API calls at the cost of increased staleness in security group discovery. Must be at least 1m.")
+	fs.StringVar(&o.FeatureGates.inputStr, "aws-feature-gates", env.WithDefaultString("AWS_FEATURE_GATES", "NodeClassCEL=false,DRANVIDIAGPU=false,DRAEFA=false,RebootForRepair=false"), "Optional AWS-specific features can be enabled / disabled using feature gates. Current options are: NodeClassCEL, DRANVIDIAGPU, DRAEFA, RebootForRepair.")
+}
+
+func (o *Options) Parse(fs *coreoptions.FlagSet, args ...string) error {
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			os.Exit(0)
+		}
+		return fmt.Errorf("parsing flags, %w", err)
+	}
+	gates, err := ParseFeatureGates(o.FeatureGates.inputStr)
+	if err != nil {
+		return fmt.Errorf("parsing feature gates, %w", err)
+	}
+	o.FeatureGates = gates
+	if err := o.Validate(); err != nil {
+		return fmt.Errorf("validating options, %w", err)
+	}
+	return nil
+}
+
+func DefaultFeatureGates() FeatureGates {
+	return FeatureGates{
+		NodeClassCEL:    false,
+		DRANVIDIAGPU:    false,
+		DRAEFA:          false,
+		RebootForRepair: false,
+	}
+}
+
+func ParseFeatureGates(gateStr string) (FeatureGates, error) {
+	gateMap := map[string]bool{}
+	gates := DefaultFeatureGates()
+
+	// Parses feature gates with the upstream mechanism. This is meant to be used with flag directly but this enables
+	// simple merging with environment vars. Unknown gates are ignored, matching karpenter-core's behavior.
+	if err := cliflag.NewMapStringBool(&gateMap).Set(gateStr); err != nil {
+		return gates, err
+	}
+	if val, ok := gateMap["NodeClassCEL"]; ok {
+		gates.NodeClassCEL = val
+	}
+	if val, ok := gateMap["DRANVIDIAGPU"]; ok {
+		gates.DRANVIDIAGPU = val
+	}
+	if val, ok := gateMap["DRAEFA"]; ok {
+		gates.DRAEFA = val
+	}
+	if val, ok := gateMap["RebootForRepair"]; ok {
+		gates.RebootForRepair = val
+	}
+
+	return gates, nil
+}
+
+func (o *Options) ToContext(ctx context.Context) context.Context {
+	return ToContext(ctx, o)
+}
+
+func ToContext(ctx context.Context, opts *Options) context.Context {
+	return context.WithValue(ctx, optionsKey{}, opts)
+}
+
+func FromContext(ctx context.Context) *Options {
+	retval := ctx.Value(optionsKey{})
+	if retval == nil {
+		return nil
+	}
+	return retval.(*Options)
+}
